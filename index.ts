@@ -5,6 +5,10 @@ const LocalStorage = require('node-localstorage').LocalStorage
 const local_storage = new LocalStorage('localStorage')
 
 
+const delay = (ms: number) => {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 export interface ETradeConfig {
     watchList: string
     useKeys: string
@@ -340,10 +344,55 @@ export async function getQuotes(symbols:string, query:any, keys:KeyConfig, acces
     return (await run('GET', url, query, accessToken, keys)).QuoteResponse
 }
 
-export interface Broker {
+export interface Tick {
+    balance: number
+    quotes: QuoteResponse
+}
+
+export class Order {
+    timestamp:number
+    symbol:string
+    shares:number
+    limit:number
+    toOpen:boolean
+    isOrderFilled:boolean
+
+    constructor( timestamp:number, symbol:string, shares:number, limit:number, toOpen:boolean ) {
+        this.timestamp = timestamp
+        this.symbol = symbol
+        this.shares = shares
+        this.limit = limit
+        this.toOpen = toOpen
+        this.isOrderFilled = false
+    }
+}
+
+export class Position {
+    costBasis: number //avg cost per share
+    marker: number //last share price
+    symbol: string
+    shares: number
+
+    constructor(
+        costBasis: number,
+        marker: number,
+        symbol: string,
+        shares: number
+    ) {
+        this.costBasis = costBasis
+        this.marker = marker
+        this.symbol = symbol
+        this.shares = shares
+    }
+}
+
+export interface Broker extends AsyncIterator<Tick>{
     connect:() => Promise<void>
-    getBalance:() => Promise<number>
-    getQuotes:() => Promise<QuoteResponse>
+    [Symbol.asyncIterator]:() => Broker
+    next:() => Promise<IteratorResult<Tick>>
+    createOrder:(symbol:string, shares:number, limit:number, toOpen:boolean) => Promise<void>
+    getOrders:() => Promise<Order[]>
+    getPositions:() => Promise<Position[]>
 }
 
 export class ETradeBroker implements Broker {
@@ -352,12 +401,16 @@ export class ETradeBroker implements Broker {
     watchList:string
     keyConfig:KeyConfig
     accessToken:OAuthToken
+    hadOpenHours:boolean
+    sleepDuration:number
 
-    constructor(config:ETradeConfig, keys:KeySet) {
+    constructor(config:ETradeConfig, keys:KeySet, sleepDuration:number) {
         this.keyConfig = (config.useKeys === "production") ? keys.production : keys.sandbox
         this.accountIdKey = config.accountIdKey
         this.watchList = config.watchList
         this.accessToken = {} as OAuthToken
+        this.hadOpenHours = false
+        this.sleepDuration = sleepDuration
     }
 
     async connect() {
@@ -381,11 +434,38 @@ export class ETradeBroker implements Broker {
         console.log((accountList || (await getAccountList(this.keyConfig, this.accessToken))).Accounts)
     }
 
+    [Symbol.asyncIterator]() {return this}
+
+    getOrders(): Promise<Order[]> {return Promise.resolve([])}
+    getPositions(): Promise<Position[]> {return Promise.resolve([])}
+
     async submitCode(): Promise<any> {
         const code = process.argv[2]
         const requestToken = JSON.parse(local_storage.getItem('requestToken'));
         this.accessToken = await getAccessToken(this.keyConfig, requestToken, code);
         local_storage.setItem("accessToken", JSON.stringify(this.accessToken));
+    }
+
+    async next(): Promise<IteratorResult<Tick>> {
+        while(true) {
+            try {
+                const [nil, quotes, balance] = await Promise.all([
+                    delay(this.sleepDuration),
+                    this.getQuotes(),
+                    Promise.resolve(0)//this.getBalance()
+                ])
+
+                const isExtHours = quotes.QuoteData.map(q => q.All.ExtendedHourQuoteDetail !== undefined).reduce((acc,cur) => acc || cur, false)
+                this.hadOpenHours = this.hadOpenHours || !isExtHours
+                const done = this.hadOpenHours && isExtHours
+                return {
+                    value: {balance: balance, quotes: quotes},
+                    done: done
+                }
+            } catch (e) {
+                console.error(e)
+            }
+        }
     }
 
     getBalance(): Promise<number> {
@@ -397,18 +477,16 @@ export class ETradeBroker implements Broker {
         return getQuotes(this.watchList, { detailFlag: 'ALL' }, this.keyConfig, this.accessToken)
     }
 
+    async createOrder(symbol:string, shares:number, limit:number, toOpen:boolean) {
+
+    }
 }
 
 export async function runBot(
-    interval:number,
     broker:Broker,
-    onBalance: ((balance: number) => void) | null,
-    onQuote: ((quotes: QuoteResponse) => void),
+    onBalance: ((balance: number) => Promise<void>) | null,
+    onQuotes: ((quotes: QuoteResponse) => Promise<void>) | null
     ) {
-        const delay = (ms: number) => {
-            return new Promise(resolve => setTimeout(resolve, ms))
-        }
-
         try {
             await broker.connect()
         } catch (error) {
@@ -416,13 +494,10 @@ export async function runBot(
             return
         }
 
-        while(true) {
+        for await (const tick of broker) {
             try {
-                await Promise.all([
-                    delay(interval),
-                    async () => {if (onBalance != null) onBalance(await broker.getBalance())},
-                    onQuote(await broker.getQuotes())
-                ])
+                if (onBalance !== null) await onBalance(tick.balance)
+                if (onQuotes !== null) await onQuotes(tick.quotes)
             } catch (error) {
                 console.error(error)
             }
